@@ -1,0 +1,592 @@
+commit 66eea293193369087ae63f658f7b2a3044ef85c8
+Author: Sumith1896 <sumith1896@gmail.com>
+Date:   Sun Oct 2 16:37:13 2016 +0530
+
+    Copy-on-Write Fork in xv6
+
+diff --git a/Makefile b/Makefile
+index 93d525a..cd4c334 100644
+--- a/Makefile
++++ b/Makefile
+@@ -171,6 +171,7 @@ UPROGS=\
+ 	_sh\
+ 	_stressfs\
+ 	_usertests\
++	_testcow\
+ 	_wc\
+ 	_zombie\
+ 
+@@ -242,7 +243,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+ 	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
+-	printf.c umalloc.c\
++	printf.c umalloc.c testcow.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+ 
+diff --git a/defs.h b/defs.h
+index 8f01b1f..c1df62f 100644
+--- a/defs.h
++++ b/defs.h
+@@ -68,6 +68,7 @@ char*           kalloc(void);
+ void            kfree(char*);
+ void            kinit1(void*, void*);
+ void            kinit2(void*, void*);
++int           	getNumFreePages(void);
+ 
+ // kbd.c
+ void            kbdintr(void);
+@@ -177,10 +178,13 @@ void            freevm(pde_t*);
+ void            inituvm(pde_t*, char*, uint);
+ int             loaduvm(pde_t*, char*, struct inode*, uint, uint);
+ pde_t*          copyuvm(pde_t*, uint);
++void            pagefault_at(uint);
+ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+ void            clearpteu(pde_t *pgdir, char *uva);
++void            initrefcounts(void);
++char*           uva2pa(pde_t *pgdir, char *uva);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kalloc.c b/kalloc.c
+index ca30d55..90e5b7b 100644
+--- a/kalloc.c
++++ b/kalloc.c
+@@ -19,6 +19,7 @@ struct run {
+ struct {
+   struct spinlock lock;
+   int use_lock;
++  int num_free;
+   struct run *freelist;
+ } kmem;
+ 
+@@ -32,6 +33,7 @@ kinit1(void *vstart, void *vend)
+ {
+   initlock(&kmem.lock, "kmem");
+   kmem.use_lock = 0;
++  kmem.num_free = 0;
+   freerange(vstart, vend);
+ }
+ 
+@@ -72,6 +74,7 @@ kfree(char *v)
+   r = (struct run*)v;
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  kmem.num_free++;
+   if(kmem.use_lock)
+     release(&kmem.lock);
+ }
+@@ -87,10 +90,25 @@ kalloc(void)
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r) {
+     kmem.freelist = r->next;
++    kmem.num_free--;
++  }
+   if(kmem.use_lock)
+     release(&kmem.lock);
+   return (char*)r;
+ }
+ 
++// Returns the number of free pages
++int
++getNumFreePages(void)
++{
++  int num;
++
++  if(kmem.use_lock)
++    acquire(&kmem.lock);
++  num = kmem.num_free;
++  if(kmem.use_lock)
++    release(&kmem.lock);
++  return num;
++}
+diff --git a/main.c b/main.c
+index 731e429..da82c71 100644
+--- a/main.c
++++ b/main.c
+@@ -36,6 +36,7 @@ main(void)
+     timerinit();   // uniprocessor timer
+   startothers();   // start other processors
+   kinit2(P2V(4*1024*1024), P2V(PHYSTOP)); // must come after startothers()
++  initrefcounts();
+   userinit();      // first user process
+   mpmain();        // finish this processor's setup
+ }
+diff --git a/syscall.c b/syscall.c
+index 9ae7536..b638d3e 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -98,6 +98,8 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_getNumFreePages(void);
++extern int sys_viphy(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -114,6 +116,8 @@ static int (*syscalls[])(void) = {
+ [SYS_sbrk]    sys_sbrk,
+ [SYS_sleep]   sys_sleep,
+ [SYS_uptime]  sys_uptime,
++[SYS_getNumFreePages]  sys_getNumFreePages,
++[SYS_viphy]   sys_viphy,
+ [SYS_open]    sys_open,
+ [SYS_write]   sys_write,
+ [SYS_mknod]   sys_mknod,
+diff --git a/syscall.h b/syscall.h
+index bc5f356..8cdce12 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_getNumFreePages  22
++#define SYS_viphy  23
+diff --git a/sysproc.c b/sysproc.c
+index 6b585e0..ccd4086 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,21 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// return the number of free pages in the system
++int
++sys_getNumFreePages(void)
++{
++  return getNumFreePages();
++}
++
++// return the physical address for the virtual address
++int
++sys_viphy(void)
++{
++  int va;
++  if(argint(0, &(va)) < 0)
++    return -1;
++
++  return (int)uva2pa(proc->pgdir, (char*)va);
++}
+diff --git a/testcow.c b/testcow.c
+new file mode 100644
+index 0000000..d238fc6
+--- /dev/null
++++ b/testcow.c
+@@ -0,0 +1,148 @@
++#include "param.h"
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "fs.h"
++#include "fcntl.h"
++#include "syscall.h"
++#include "traps.h"
++#include "memlayout.h"
++
++int a = 1;
++
++void
++testcow(void) {
++
++  printf(1, "\n\n\nRunning testcow()...\n");
++  printf(1, "Before fork %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++  printf(1, "Forking now...\n");
++
++  if(fork() == 0) {
++    printf(1, "Child %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++    sleep(100);
++    printf(1, "Updating a in child...\n");
++    a = 2;
++    printf(1, "Child %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++    exit();
++  } else {
++    printf(1, "Parent %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++    while(wait()!=-1);
++    printf(1, "Child reaped...\n");
++    printf(1, "Parent %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++  }
++
++  return;
++}
++
++void
++testcowmult(void) {
++
++  printf(1, "\n\n\nRunning testcowmult()...\n");
++  printf(1, "Before fork %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++  printf(1, "Forking 3 new processes now...\n");
++
++  if(fork() == 0) {
++    if(fork() == 0) {
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(50);
++      printf(1, "\n\nUpdating a in %d...\n",getpid());
++      a = 2;
++      sleep(200);
++
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(200);
++      exit();
++    }
++    else {
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(50);
++      printf(1, "\n\nUpdating a in %d...\n",getpid());
++      a = 3;
++      sleep(200);
++
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(200);
++      wait();
++      exit();
++    }
++  } else {
++    if(fork() == 0) {
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(50);
++      printf(1, "\n\nUpdating a in %d...\n",getpid());
++      a = 4;
++      sleep(200);
++
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(200);
++      exit();
++    }
++    else {
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++      sleep(250);
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(50);
++      printf(1, "\n\nUpdating a in %d...\n",getpid());
++      a = 2;
++      sleep(200);
++
++      printf(1, "Process %d, phy addr. = %p and numFree = %d\n",getpid(), viphy(&a), getNumFreePages());
++
++      sleep(200);
++      wait();
++    }
++
++    wait();
++  }
++  printf(1, "\n\nAfter reaping %d, a = %d, phy addr. = %p and numFree = %d\n",getpid(), a, viphy(&a), getNumFreePages());
++
++
++  return;
++}
++
++int
++main(int argc, char *argv[])
++{
++  printf(1, "Testing CoW implementation...\n");
++
++  // test forking a single child
++  testcow();
++
++  // exhaustive test with multiple children
++  testcowmult();
++
++  exit();
++}
+diff --git a/trap.c b/trap.c
+index e6b3784..6cdc556 100644
+--- a/trap.c
++++ b/trap.c
+@@ -46,6 +46,8 @@ trap(struct trapframe *tf)
+     return;
+   }
+ 
++  uint va_pgflt;
++
+   switch(tf->trapno){
+   case T_IRQ0 + IRQ_TIMER:
+     if(cpunum() == 0){
+@@ -77,6 +79,10 @@ trap(struct trapframe *tf)
+             cpunum(), tf->cs, tf->eip);
+     lapiceoi();
+     break;
++  case T_PGFLT:
++    va_pgflt = rcr2();
++    pagefault_at(va_pgflt);
++    break;
+ 
+   //PAGEBREAK: 13
+   default:
+diff --git a/user.h b/user.h
+index f45b8d5..4ed5a22 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int getNumFreePages(void);
++int viphy(int *);
+ 
+ // ulib.c
+ int stat(char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..e302c19 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,5 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(getNumFreePages)
++SYSCALL(viphy)
+diff --git a/vm.c b/vm.c
+index d9aaa7e..c15de01 100644
+--- a/vm.c
++++ b/vm.c
+@@ -6,10 +6,61 @@
+ #include "mmu.h"
+ #include "proc.h"
+ #include "elf.h"
++#include "spinlock.h"
+ 
+ extern char data[];  // defined by kernel.ld
+ pde_t *kpgdir;  // for use in scheduler()
+ 
++// have a ref.count variable for the physical frames
++// char just to occupy less memory
++struct {
++  char count[PHYSTOP >> PGSHIFT];
++  struct spinlock lock;
++} ref;
++
++void initref(uint pa) {
++  acquire(&ref.lock);
++  ref.count[pa >> PGSHIFT] = 1;
++  release(&ref.lock);
++}
++
++char incrref(uint pa) {
++  char a;
++
++  acquire(&ref.lock);
++  a = ++(ref.count[pa >> PGSHIFT]);
++  release(&ref.lock);
++
++  return a;
++}
++
++char decrref(uint pa) {
++  char a;
++
++  acquire(&ref.lock);
++  a = --(ref.count[pa >> PGSHIFT]);
++  release(&ref.lock);
++
++  return a;
++}
++
++char retref(uint pa) {
++  return (ref.count[pa >> PGSHIFT]);
++}
++
++void initrefcounts(void) {
++  initlock(&ref.lock, "reflock");
++
++  int i = 0;
++  acquire(&ref.lock);
++  for(; i < PHYSTOP >> PGSHIFT; i++) {
++    ref.count[i] = 0;
++  }
++  release(&ref.lock);
++
++  return;
++}
++
+ // Set up CPU's kernel segment descriptors.
+ // Run once on entry on each CPU.
+ void
+@@ -190,6 +241,7 @@ inituvm(pde_t *pgdir, char *init, uint sz)
+   mem = kalloc();
+   memset(mem, 0, PGSIZE);
+   mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_W|PTE_U);
++  initref(V2P(mem));
+   memmove(mem, init, sz);
+ }
+ 
+@@ -245,6 +297,7 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+       kfree(mem);
+       return 0;
+     }
++    initref(V2P(mem));
+   }
+   return newsz;
+ }
+@@ -271,8 +324,10 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+       pa = PTE_ADDR(*pte);
+       if(pa == 0)
+         panic("kfree");
+-      char *v = P2V(pa);
+-      kfree(v);
++      if(decrref(pa) == 0) {
++        char *v = P2V(pa);
++        kfree(v);
++      }
+       *pte = 0;
+     }
+   }
+@@ -311,6 +366,64 @@ clearpteu(pde_t *pgdir, char *uva)
+   *pte &= ~PTE_U;
+ }
+ 
++// Do a regular copy when written on to a CoW page
++// handle the page fault
++void
++pagefault_at(uint va)
++{
++  uint pa;
++  pte_t *pte;
++  char *mem;
++
++  if(va >= KERNBASE) {
++    cprintf("Illegal range of virtual address %d, process killed!\n", va);
++    proc->killed = 1;
++    return;
++  }
++
++  pte = walkpgdir(proc->pgdir, (void*)va, 0);
++
++  if(pte == 0) {
++    cprintf("Page table entry lookup failed, process killed!");
++    proc->killed = 1;
++    return;
++  }
++
++  if(!(*pte & PTE_P)) {
++    cprintf("Page table entry not present, process killed!");
++    proc->killed = 1;
++    return;
++  }
++
++  if(!(*pte & PTE_U)) {
++    cprintf("Cannot access kernel page, process killed!");
++    proc->killed = 1;
++    return;
++  }
++
++  if(*pte & PTE_W) {
++    panic("Page already writtable");
++    return;
++  }
++
++  pa = PTE_ADDR(*pte);
++  if(retref(pa) == 1) {
++    *pte = *pte | PTE_W;
++  }
++  else {
++    if((mem = kalloc()) == 0){
++      return;
++    }
++    memmove(mem, P2V(pa), PGSIZE);
++    incrref(V2P(mem));
++    *pte = V2P(mem) | PTE_P | PTE_W | PTE_U;
++    decrref(pa);
++  }
++
++  lcr3(V2P(proc->pgdir));
++  return;
++}
++
+ // Given a parent process's page table, create a copy
+ // of it for a child.
+ pde_t*
+@@ -319,7 +432,6 @@ copyuvm(pde_t *pgdir, uint sz)
+   pde_t *d;
+   pte_t *pte;
+   uint pa, i, flags;
+-  char *mem;
+ 
+   if((d = setupkvm()) == 0)
+     return 0;
+@@ -328,18 +440,21 @@ copyuvm(pde_t *pgdir, uint sz)
+       panic("copyuvm: pte should exist");
+     if(!(*pte & PTE_P))
+       panic("copyuvm: page not present");
++    *pte = *pte & ~PTE_W;
+     pa = PTE_ADDR(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto bad;
+-    memmove(mem, (char*)P2V(pa), PGSIZE);
+-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0)
++    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
+       goto bad;
++    incrref(pa);
+   }
++  // flush the TLB caches
++  lcr3(V2P(pgdir));
+   return d;
+ 
+ bad:
+   freevm(d);
++  // some pages may have still been modified, flush
++  lcr3(V2P(pgdir));
+   return 0;
+ }
+ 
+@@ -358,6 +473,18 @@ uva2ka(pde_t *pgdir, char *uva)
+   return (char*)P2V(PTE_ADDR(*pte));
+ }
+ 
++// Map user virtual address to physical address
++char*
++uva2pa(pde_t *pgdir, char *uva)
++{
++  pde_t *pde;
++  pte_t *pgtab;
++  pde = &(pgdir)[PDX(uva)];
++  pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
++
++  return (char*)PTE_ADDR(pgtab[PTX(uva)]);
++}
++
+ // Copy len bytes from p to user address va in page table pgdir.
+ // Most useful when pgdir is not the current page table.
+ // uva2ka ensures this only works for PTE_U pages.
